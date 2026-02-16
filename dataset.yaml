@@ -1,0 +1,15 @@
+# dataset.yaml
+path: . # Root directory (current script dir)
+train: dataset/images/train
+val: dataset/images/val
+# val: images/val
+# test: images/test # Optional
+
+# Classes
+names:
+  0: single_gate
+  1: double_gate
+
+# Keypoint Shape: [number of keypoints, number of dims]
+# Dims are 3 because we use [x, y, visibility]
+kpt_shape: [6, 3]
