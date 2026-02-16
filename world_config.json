@@ -1,0 +1,50 @@
+{
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "fov": 1.674,
+    "distortion": [0.0, 0.0, 0.0, 0.0, 0.0], 
+    "offset_to_base": {
+      "translation": [-0.0015, 0.00604, 0.0623],
+      "rotation_pitch": -0.523599
+    }
+  },
+  "gate_types": {
+    "single_gate": {
+      "width": 2.70,
+      "height": 2.70,
+      "z_min": 0.10,
+      "z_max": 2.80,
+      "local_keypoints": [
+        [0, -1.35, 0.10],
+        [0, 1.35, 0.10],
+        [0, 1.35, 2.80],
+        [0, -1.35, 2.80]
+        ]
+    },
+    "double_gate": {
+    "width": 2.70,
+    "height": 5.40,
+    "local_keypoints": [
+        [0, -1.35, 0.10],
+        [0, 1.35, 0.10],
+        [0, -1.35, 2.80],
+        [0, 1.35, 2.80],
+        [0, 1.35, 5.50],
+        [0, -1.35, 5.50]
+    ]
+    }
+  },
+  "world_layout": [
+    {"name": "gate1", "type": "single_gate", "pose": [2, 0, 0, 0, 0, 0.0]},
+    {"name": "gate2", "type": "single_gate", "pose": [8, -4, 0, 0, 0, -0.7854]},
+    {"name": "gate3", "type": "single_gate", "pose": [9, -12, 0, 0, 0, -1.0472]},
+    {"name": "gate4", "type": "single_gate", "pose": [12, -22, 0, 0, 0, -1.5708]},
+    {"name": "gate5", "type": "single_gate", "pose": [7, -28, 0, 0, 0, -0.17454]},
+    {"name": "gate6", "type": "single_gate", "pose": [2, -20, 0, 0, 0, 0.0]},
+    {"name": "gate7", "type": "double_gate", "pose": [-3, -28, 0, 0, 0, -1.74534]},
+    {"name": "gate8", "type": "single_gate", "pose": [-4, -20, 0, 0, 0, -1.396267]},
+    {"name": "gate9", "type": "single_gate", "pose": [-6, -12, 0, 0, 0, -1.74534]},
+    {"name": "gate10", "type": "double_gate", "pose": [-4, -4, 0, 0, 0, -2.3562]}
+  ]
+}
