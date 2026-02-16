@@ -1,16 +1,17 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import cv2
 import json
 import math
 import os
-import subprocess
 import time
-import re
 import random
+import subprocess
 import numpy as np
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
 from scipy.spatial.transform import Rotation as R
 
 class GateVisualTester(Node):
@@ -18,6 +19,7 @@ class GateVisualTester(Node):
         super().__init__('gate_visual_tester')
         self.bridge = CvBridge()
         self.latest_msg = None
+        self.latest_odom = None
 
         # --- Section: Load Config ---
         with open('world_config.json', 'r') as f:
@@ -33,22 +35,50 @@ class GateVisualTester(Node):
 
         # Output Directories (YOLO Standard)
         self.base_dir = os.path.expanduser('~/mav_sim/dataset')
-        self.split_ratio = 0.8  # 80% Train, 20% Val
+        self.split_ratio = 0.8
         
-        # Create subdirectories for YOLO structure
         for split in ['train', 'val']:
             os.makedirs(os.path.join(self.base_dir, 'images', split), exist_ok=True)
             os.makedirs(os.path.join(self.base_dir, 'labels', split), exist_ok=True)
 
+        # Use BEST_EFFORT QoS with depth=1 for latest odometry only
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
+        # ROS2 Subscriptions
         self.create_subscription(Image, '/X3/camera/image_raw', self.img_cb, 10)
+        self.create_subscription(Odometry, '/X3/odom', self.odom_cb, qos_profile)
+        
+        self.get_logger().info("✓ Dataset generator ready (using CLI teleport)")
 
     def img_cb(self, msg):
         self.latest_msg = msg
 
+    def odom_cb(self, msg):
+        """Store latest odometry data with timestamp"""
+        self.latest_odom = {
+            'pos': {
+                'x': msg.pose.pose.position.x,
+                'y': msg.pose.pose.position.y,
+                'z': msg.pose.pose.position.z
+            },
+            'ori': {
+                'x': msg.pose.pose.orientation.x,
+                'y': msg.pose.pose.orientation.y,
+                'z': msg.pose.pose.orientation.z,
+                'w': msg.pose.pose.orientation.w
+            },
+            'receive_time': time.time()
+        }
+
     def teleport_and_verify(self, target_pose):
-        """Section: High-Variance Randomized Teleport"""
+        """CLI-based teleport with validation (from test_teleport.py)"""
         gx, gy, gz, _, _, gyaw = target_pose
-        
+
+        # Calculate random viewpoint
         dist = random.uniform(4.0, 8.5)
         angle_offset = random.uniform(-math.radians(40), math.radians(40))
         total_yaw = gyaw + angle_offset
@@ -58,47 +88,68 @@ class GateVisualTester(Node):
         ty = gy - dist * math.sin(total_yaw)
         
         look_at_yaw = total_yaw + random.uniform(-math.radians(5), math.radians(5))
-        qz, qw = math.sin(look_at_yaw / 2), math.cos(look_at_yaw / 2)
+        qz = math.sin(look_at_yaw / 2)
+        qw = math.cos(look_at_yaw / 2)
 
+        # CLEAR OLD DATA BEFORE TELEPORT
+        self.latest_odom = None
+        self.latest_msg = None
+
+        # Build CLI command
         req_data = f'name:"X3", position:{{x:{tx}, y:{ty}, z:{tz}}}, orientation:{{z:{qz}, w:{qw}}}'
-        cmd = ["ign", "service", "-s", "/world/a2rl_track_ign/set_pose",
-                "--reqtype", "ignition.msgs.Pose", "--reptype", "ignition.msgs.Boolean",
-                "--timeout", "1000", "--req", req_data]
+        cmd = [
+            "ign", "service", "-s", "/world/a2rl_track_ign/set_pose",
+            "--reqtype", "ignition.msgs.Pose", 
+            "--reptype", "ignition.msgs.Boolean",
+            "--timeout", "2000", 
+            "--req", req_data
+        ]
 
-        self.get_logger().info(f"--- Section: Randomizing (Dist: {dist:.1f}m, Ang: {math.degrees(angle_offset):.1f}°) ---")
+        self.get_logger().info(f"Teleporting to ({tx:.2f}, {ty:.2f}, {tz:.2f})")
         
-        for i in range(2):
-            res = subprocess.run(cmd, capture_output=True)
-            if res.returncode == 0: break
-            time.sleep(0.5)
-
-        start = time.time()
-        while (time.time() - start) < 8.0:
-            check = subprocess.run(['ign', 'topic', '-e', '-t', '/model/X3/pose', '-n', '1'], capture_output=True, text=True)
-            if check.returncode == 0 and check.stdout:
-                m = re.search(r'x:\s*([-eE0-9.+]+)[\s\S]*?y:\s*([-eE0-9.+]+)', check.stdout)
-                if m and math.sqrt((float(m.group(1))-tx)**2 + (float(m.group(2))-ty)**2) < 0.3:
-                    return True
-            time.sleep(0.2)
-        return False
-
-    def get_current_pose(self, retries=5, delay=0.1):
-        for _ in range(retries):
-            cmd = ["ign", "topic", "-e", "-t", "/model/X3/pose", "-n", "1"]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            output = result.stdout.strip()
-            if not output:
-                time.sleep(delay)
+        # Execute CLI teleport
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if res.returncode != 0:
+            self.get_logger().error(f"CLI teleport failed: {res.stderr}")
+            return False, None
+        
+        # Wait for teleport to complete
+        time.sleep(0.5)
+        
+        # Flush old messages aggressively
+        for _ in range(50):
+            rclpy.spin_once(self, timeout_sec=0.02)
+        
+        # VERIFICATION: Wait for fresh synchronized data
+        target_xy = np.array([tx, ty])
+        timeout = time.time() + 3.0
+        
+        while time.time() < timeout:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            
+            # Need both image and odom
+            if self.latest_msg is None or self.latest_odom is None:
                 continue
-
-            p_m = re.search(r"position\s*{\s*x:\s*([-eE0-9.+]+)\s*y:\s*([-eE0-9.+]+)\s*z:\s*([-eE0-9.+]+)\s*}", output)
-            o_m = re.search(r"orientation\s*{\s*x:\s*([-eE0-9.+]+)\s*y:\s*([-eE0-9.+]+)\s*z:\s*([-eE0-9.+]+)\s*w:\s*([-eE0-9.+]+)\s*}", output)
-            if p_m and o_m:
-                pos = {"x": float(p_m.group(1)), "y": float(p_m.group(2)), "z": float(p_m.group(3))}
-                ori = {"x": float(o_m.group(1)), "y": float(o_m.group(2)), "z": float(o_m.group(3)), "w": float(o_m.group(4))}
-                return pos, ori
-            time.sleep(delay)
-        raise RuntimeError("CLI Pose Poll Failed")
+            
+            # Check data freshness
+            data_age = time.time() - self.latest_odom['receive_time']
+            if data_age > 0.5:
+                continue
+            
+            # Verify position
+            curr_xy = np.array([
+                self.latest_odom['pos']['x'], 
+                self.latest_odom['pos']['y']
+            ])
+            error = np.linalg.norm(curr_xy - target_xy)
+            
+            if error < 0.5:  # Within 50cm is good enough
+                self.get_logger().info(f"✓ Teleport verified (error: {error:.3f}m)")
+                return True, (self.latest_odom['pos'], self.latest_odom['ori'])
+        
+        self.get_logger().warn("Teleport verification timeout")
+        return False, None
 
     def run(self, total_goal=5000):
         type_to_idx = {name: i for i, name in enumerate(self.config['gate_types'].keys())}
@@ -107,51 +158,44 @@ class GateVisualTester(Node):
         num_gates = len(self.config['world_layout'])
         num_passes = (total_goal // num_gates) + 1
         count = 0
+        failures = 0
+        consecutive_failures = 0
 
         for p in range(num_passes):
             layout = self.config['world_layout'].copy()
             random.shuffle(layout)
             
             for i, gate in enumerate(layout):
-                if count >= total_goal: break
+                if count >= total_goal: 
+                    break
+
+                # Safety: pause if too many consecutive failures
+                if consecutive_failures >= 5:
+                    self.get_logger().warn("5 consecutive failures - pausing for recovery")
+                    time.sleep(3.0)
+                    consecutive_failures = 0
 
                 try:
-                    self.get_logger().info(f"=== Section: Pass {p+1} | Gate {i+1} ===")
+                    self.get_logger().info(f"=== Pass {p+1} | Gate {i+1}/{len(layout)} ===")
                     
-                    # 1. Teleport
-                    if not self.teleport_and_verify(gate['pose']):
+                    # 1. Teleport with verification
+                    success, pose_data = self.teleport_and_verify(gate['pose'])
+                    if not success:
+                        failures += 1
+                        consecutive_failures += 1
+                        self.get_logger().warn(f"Teleport failed (total: {failures}, consecutive: {consecutive_failures})")
+                        time.sleep(1.0)
                         continue
-
-                    # 2. STRICT SETTLE (Ported from your test code)
-                    # This prevents the "drifting boxes" by ensuring physics has stopped
-                    gx, gy, gz = gate['pose'][:3]
-                    target_pos = np.array([gx, gy, gz])
-                    for _ in range(15):
-                        pos, _ = self.get_current_pose()
-                        curr_pos = np.array([pos['x'], pos['y'], pos['z']])
-                        # We check distance to the teleport target, not the gate center
-                        # Note: teleport_and_verify uses randomized tx, ty, tz, 
-                        # so we should ideally verify against those, but checking 
-                        # for 'near-zero velocity' or a tight loop is usually enough.
-                        time.sleep(0.1) 
-
-                    # 3. Flush ROS Buffer
-                    self.latest_msg = None
-                    for _ in range(15): rclpy.spin_once(self, timeout_sec=0.01)
-
-                    # 4. Wait for fresh frame
-                    while rclpy.ok() and self.latest_msg is None:
-                        rclpy.spin_once(self, timeout_sec=0.1)
-
-                    # 5. Capture LOCK (Sync Point)
-                    target_img_msg = self.latest_msg 
-                    pos, quat = self.get_current_pose()
-
-                    # Convert only after you have both pieces of data
+                    
+                    consecutive_failures = 0
+                    pos, quat = pose_data
+                    
+                    # 2. Capture locked image
+                    target_img_msg = self.latest_msg
                     img = self.bridge.imgmsg_to_cv2(target_img_msg, 'bgr8')
                     h, w = img.shape[:2]
 
-                    # 2. --- Section: Projection Matrix ---
+                    # 3. Build projection matrix
                     t_wb = np.array([pos['x'], pos['y'], pos['z']])
                     R_wb = R.from_quat([quat['x'], quat['y'], quat['z'], quat['w']]).as_matrix()
                     t_bc = np.array([-0.0015, 0.00604, 0.0623])
@@ -166,41 +210,31 @@ class GateVisualTester(Node):
                     rvec, _ = cv2.Rodrigues(R_cw)
                     tvec = t_cw.reshape(3, 1)
 
-                    # 3. --- Section: Project and Generate YOLO Annotations ---
+                    # 4. Generate annotations
                     zero_dist = np.zeros(5) 
                     annotation_lines = []
 
-                    # Build ALL annotations for this single image capture
                     for g in self.config['world_layout']:
                         is_target = (g['name'] == gate['name'])
                         gtype_name = g['type']
                         gtype_cfg = self.config['gate_types'][gtype_name]
                         local_pts = np.array(gtype_cfg['local_keypoints'], dtype=np.float32)
                         
-                        # Transform to World & Camera Space
                         r_gate = R.from_euler('z', g['pose'][5])
                         world_pts = r_gate.apply(local_pts) + np.array(g['pose'][:3])
                         pts_in_cam = (R_cw @ world_pts.T).T + t_cw.flatten()
 
-                        # Frustum Culling
                         if np.all(pts_in_cam[:, 2] < 0.1): continue
                         front_pts_idx = pts_in_cam[:, 2] > 0.1
                         if not np.any(front_pts_idx): continue
 
-                        # Project to pixels
                         img_pts, _ = cv2.projectPoints(world_pts, rvec, tvec, self.K, zero_dist)
                         img_pts = img_pts.reshape(-1, 2)
                         
-                        # Visibility Check
-                        visible_count = 0
-                        for k, pt in enumerate(img_pts):
-                            if pts_in_cam[k, 2] > 0.1 and (0 <= pt[0] < w and 0 <= pt[1] < h):
-                                visible_count += 1
-
-                        # Filter: Ensure the gate is actually worth labeling
+                        visible_count = sum(1 for k, pt in enumerate(img_pts) 
+                                       if pts_in_cam[k, 2] > 0.1 and (0 <= pt[0] < w and 0 <= pt[1] < h))
                         if visible_count < (1 if is_target else 2): continue
 
-                        # Bounding Box
                         front_img_pts = img_pts[front_pts_idx]
                         x_min_c, x_max_c = np.clip([np.min(front_img_pts[:, 0]), np.max(front_img_pts[:, 0])], 0, w)
                         y_min_c, y_max_c = np.clip([np.min(front_img_pts[:, 1]), np.max(front_img_pts[:, 1])], 0, h)
@@ -210,7 +244,6 @@ class GateVisualTester(Node):
                         by = (y_min_c + (y_max_c - y_min_c) / 2.0) / h
                         if bw < 0.005 or bh < 0.005: continue
 
-                        # Keypoints
                         kpt_entries = []
                         for k, pt in enumerate(img_pts):
                             knx, kny = pt[0] / w, pt[1] / h
@@ -225,33 +258,41 @@ class GateVisualTester(Node):
                         kpt_str = " " + " ".join(kpt_entries)
                         annotation_lines.append(f"{class_idx} {bx:.6f} {by:.6f} {bw:.6f} {bh:.6f}{kpt_str}")
 
-                    # --- OUTSIDE the gate loop: Save ONCE per image ---
                     if annotation_lines:
                         split = 'train' if random.random() < self.split_ratio else 'val'
                         img_save_path = os.path.join(self.base_dir, 'images', split)
                         lbl_save_path = os.path.join(self.base_dir, 'labels', split)
 
-                        # Unique file stem based on count/time
-                        file_stem = f"frame_{count}_{int(time.time()*100)}"
+                        file_stem = f"frame_{count}_{int(time.time()*1000)}"
                         
                         cv2.imwrite(os.path.join(img_save_path, f"{file_stem}.jpg"), img)
                         with open(os.path.join(lbl_save_path, f"{file_stem}.txt"), 'w') as f:
                             f.write("\n".join(annotation_lines))
                         
                         count += 1
-                        if count % 100 == 0:
-                            self.get_logger().info(f"--- Milestone: {count}/{total_goal} images saved ---")
-                
+                        if count % 50 == 0:
+                            success_rate = (count / (count + failures)) * 100
+                            self.get_logger().info(f"✓ Progress: {count}/{total_goal} ({success_rate:.1f}% success)")
+            
                 except Exception as e:
-                    self.get_logger().error(f"Section: Error caught on Gate {i}: {e}")
-                    time.sleep(1.0) # Pause to let Ignition/ROS recover
+                    failures += 1
+                    consecutive_failures += 1
+                    self.get_logger().error(f"Error on gate {i}: {e}")
+                    import traceback
+                    self.get_logger().error(traceback.format_exc())
+                    time.sleep(1.0)
                     continue
+
+        self.get_logger().info(f"=== COMPLETE: {count} images, {failures} failures ===")
+
 def main():
     rclpy.init()
     node = GateVisualTester()
     try:
+        node.run(5000)
         # node.run(10)
-        node.run()
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
