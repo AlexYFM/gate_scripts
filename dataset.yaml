@@ -12,4 +12,4 @@ names:
 
 # Keypoint Shape: [number of keypoints, number of dims]
 # Dims are 3 because we use [x, y, visibility]
-kpt_shape: [6, 3]
+kpt_shape: [12, 3] # recall 12 is new max

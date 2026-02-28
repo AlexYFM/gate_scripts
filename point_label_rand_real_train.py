@@ -26,10 +26,17 @@ class GateVisualTester(Node):
             self.config = json.load(f)
 
         cam_cfg = self.config['camera']
-        f_len = cam_cfg['width'] / (2 * np.tan(cam_cfg['fov'] / 2))
+        hfov = cam_cfg.get('horizontal_fov', cam_cfg.get('fov'))
+        fx = cam_cfg['width'] / (2 * np.tan(hfov / 2))
+        fy = fx
+        # self.K = np.array([
+        #     [fx, 0, cam_cfg['width'] / 2],
+        #     [0, fy, cam_cfg['height'] / 2],
+        #     [0, 0, 1]
+        # ], dtype=np.float32)
         self.K = np.array([
-            [f_len, 0, cam_cfg['width'] / 2],
-            [0, f_len, cam_cfg['height'] / 2],
+            [834.0615, 0, 640],
+            [0, 834.0616, 360],
             [0, 0, 1]
         ], dtype=np.float32)
 
@@ -74,7 +81,7 @@ class GateVisualTester(Node):
             'receive_time': time.time()
         }
 
-    def teleport_and_verify(self, target_pose):
+    def teleport_and_verify(self, target_pose, gate_type):
         """CLI-based teleport with validation (from test_teleport.py)"""
         gx, gy, gz, _, _, gyaw = target_pose
 
@@ -82,7 +89,11 @@ class GateVisualTester(Node):
         dist = random.uniform(4.0, 8.5)
         angle_offset = random.uniform(-math.radians(40), math.radians(40))
         total_yaw = gyaw + angle_offset
-        tz = random.uniform(0.5, 3.0)
+        # tz = random.uniform(0.5, 3.0)
+        if gate_type == "single_gate":
+            tz = random.uniform(0.1, 1)
+        else:
+            tz = random.uniform(0.1, 2)
         
         tx = gx - dist * math.cos(total_yaw)
         ty = gy - dist * math.sin(total_yaw)
@@ -98,7 +109,7 @@ class GateVisualTester(Node):
         # Build CLI command
         req_data = f'name:"X3", position:{{x:{tx}, y:{ty}, z:{tz}}}, orientation:{{z:{qz}, w:{qw}}}'
         cmd = [
-            "ign", "service", "-s", "/world/a2rl_track_ign/set_pose",
+            "ign", "service", "-s", "/world/x3_illini_warehouse/set_pose",
             "--reqtype", "ignition.msgs.Pose", 
             "--reptype", "ignition.msgs.Boolean",
             "--timeout", "2000", 
@@ -153,7 +164,7 @@ class GateVisualTester(Node):
 
     def run(self, total_goal=5000):
         type_to_idx = {name: i for i, name in enumerate(self.config['gate_types'].keys())}
-        max_kpts = max(len(t['local_keypoints']) for t in self.config['gate_types'].values())
+        max_kpts = max(len(t['local_keypoints']) for t in self.config['gate_types'].values()) # was 6, now should be 12
         
         num_gates = len(self.config['world_layout'])
         num_passes = (total_goal // num_gates) + 1
@@ -179,7 +190,7 @@ class GateVisualTester(Node):
                     self.get_logger().info(f"=== Pass {p+1} | Gate {i+1}/{len(layout)} ===")
                     
                     # 1. Teleport with verification
-                    success, pose_data = self.teleport_and_verify(gate['pose'])
+                    success, pose_data = self.teleport_and_verify(gate['pose'], gate['type'])
                     if not success:
                         failures += 1
                         consecutive_failures += 1
@@ -198,8 +209,8 @@ class GateVisualTester(Node):
                     # 3. Build projection matrix
                     t_wb = np.array([pos['x'], pos['y'], pos['z']])
                     R_wb = R.from_quat([quat['x'], quat['y'], quat['z'], quat['w']]).as_matrix()
-                    t_bc = np.array([-0.0015, 0.00604, 0.0623])
-                    R_bc = R.from_euler('xyz', [0.0, -0.523599, 0.0]).as_matrix()
+                    t_bc = np.array([-0.0015, 0.00604, 0.0623]) # slightly up on the drone
+                    R_bc = R.from_euler('xyz', [0.0, -0.523599, 0.0]).as_matrix() # angled 30 deg up
                     
                     R_wc = R_wb @ R_bc
                     t_wc = t_wb + R_wb @ t_bc
@@ -211,7 +222,7 @@ class GateVisualTester(Node):
                     tvec = t_cw.reshape(3, 1)
 
                     # 4. Generate annotations
-                    zero_dist = np.zeros(5) 
+                    zero_dist = np.zeros(5) # replace with distortion coefficients if distortion is present in sim/images
                     annotation_lines = []
 
                     for g in self.config['world_layout']:
@@ -247,8 +258,8 @@ class GateVisualTester(Node):
                         kpt_entries = []
                         for k, pt in enumerate(img_pts):
                             knx, kny = pt[0] / w, pt[1] / h
-                            v = 2.0 if (0 <= knx <= 1 and 0 <= kny <= 1 and pts_in_cam[k, 2] > 0.1) else 1.0 if pts_in_cam[k, 2] > 0.1 else 0.0
-                            knx_s, kny_s = np.clip([knx, kny], 0.0, 1.0)
+                            v = 2.0 if (0 <= knx <= 1 and 0 <= kny <= 1 and pts_in_cam[k, 2] > 0.1) else 0.0 # getting rid of 1 visualization
+                            knx_s, kny_s = np.clip([knx, kny], 0.0, 1.0) # this technically doesn't do anything anymore
                             kpt_entries.append(f"{knx_s:.6f} {kny_s:.6f} {v}")
                         
                         while len(kpt_entries) < max_kpts:
